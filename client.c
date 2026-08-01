@@ -92,6 +92,11 @@ client_free(uwsd_client_context_t *cl, const char *reason, ...)
 	uloop_timeout_cancel(&cl->upstream.utm);
 	uloop_fd_delete(&cl->upstream.ufd);
 
+	if (cl->upstream.ssl) {
+		uwsd_ssl_close(&cl->upstream);
+		uwsd_ssl_client_free(cl);
+	}
+
 	if (cl->upstream.ufd.fd != -1)
 		close(cl->upstream.ufd.fd);
 
@@ -119,6 +124,7 @@ client_free(uwsd_client_context_t *cl, const char *reason, ...)
 	free(cl->request_uri);
 
 	free(cl->ws.error.msg);
+	free(cl->script_tx.buf);
 
 	list_del(&cl->list);
 	free(cl);
@@ -133,7 +139,7 @@ client_free_all(void)
 		if (cl->protocol == UWSD_PROTOCOL_WS) {
 			uwsd_ws_connection_close(cl,
 				cl->ws.error.code ? cl->ws.error.code : STATUS_GOING_AWAY,
-				cl->ws.error.msg ? cl->ws.error.msg : "Server shutting down");
+				"%s", cl->ws.error.msg ? cl->ws.error.msg : "Server shutting down");
 		}
 		else {
 			client_free(cl, "server shutdown");

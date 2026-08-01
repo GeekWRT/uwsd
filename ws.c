@@ -231,8 +231,14 @@ ws_downstream_rx(uwsd_client_context_t *cl)
 		case STATE_WS_PAYLOAD:
 			uwsd_io_getpos(conn)[-1] ^= cl->ws.mask[cl->ws.buflen++ % sizeof(cl->ws.mask)];
 
-			if (cl->ws.buflen == cl->ws.len)
+			if (cl->ws.buflen == cl->ws.len) {
 				ws_state_transition(cl, STATE_WS_COMPLETE);
+
+				/* ws_state_transition() clears buflen, but ws_handle_frame_payload()
+				 * still needs the received length to place the final control frame
+				 * chunk at the correct offset in the aggregation buffer. */
+				cl->ws.buflen = cl->ws.len;
+			}
 
 			break;
 
@@ -252,7 +258,7 @@ ws_downstream_tx_iov(uwsd_client_context_t *cl)
 		return false; /* error or partial send */
 
 	/* we completely sent a close message, tear down connection */
-	if (cl->tx[1].iov_base && cl->ws.buf.frameheader.hdr.opcode == OPCODE_CLOSE) {
+	if (cl->tx[1].iov_base && cl->ws.txframe.hdr.opcode == OPCODE_CLOSE) {
 		if (cl->ws.error.code)
 			ws_terminate(cl, cl->ws.error.code, "%s", cl->ws.error.msg ? cl->ws.error.msg : "");
 		else
@@ -271,29 +277,29 @@ ws_downstream_tx(uwsd_client_context_t *cl, uwsd_ws_opcode_t opcode, bool add_he
 	size_t hlen = 0;
 
 	if (add_header) {
-		memset(&cl->ws.buf.frameheader, 0, sizeof(cl->ws.buf.frameheader));
+		memset(&cl->ws.txframe, 0, sizeof(cl->ws.txframe));
 
-		cl->ws.buf.frameheader.hdr.opcode = opcode;
-		cl->ws.buf.frameheader.hdr.fin = true;
+		cl->ws.txframe.hdr.opcode = opcode;
+		cl->ws.txframe.hdr.fin = true;
 
 		if (len > 0xffff) {
-			cl->ws.buf.frameheader.hdr.len = 127;
-			cl->ws.buf.frameheader.ext.len64 = htobe64(len);
+			cl->ws.txframe.hdr.len = 127;
+			cl->ws.txframe.ext.len64 = htobe64(len);
 			hlen = sizeof(ws_frame_header_t) + sizeof(uint64_t);
 		}
 		else if (len > 0x7d) {
-			cl->ws.buf.frameheader.hdr.len = 126;
-			cl->ws.buf.frameheader.ext.len16 = htobe16(len);
+			cl->ws.txframe.hdr.len = 126;
+			cl->ws.txframe.ext.len16 = htobe16(len);
 			hlen = sizeof(ws_frame_header_t) + sizeof(uint16_t);
 		}
 		else {
-			cl->ws.buf.frameheader.hdr.len = len;
+			cl->ws.txframe.hdr.len = len;
 			hlen = sizeof(ws_frame_header_t);
 		}
 	}
 
 	uwsd_iov_put(cl,
-		&cl->ws.buf.frameheader, hlen,
+		&cl->ws.txframe, hlen,
 		data, len);
 
 	errno = 0;
@@ -431,10 +437,16 @@ uwsd_ws_state_upstream_connected(uwsd_client_context_t *cl, uwsd_connection_stat
 	/* NB: Script workers will deal with the HTTP upgrade reply themselves as
 	 * it depends on subprotocol accepted by the onConnect() callback. */
 	if (cl->action->type == UWSD_ACTION_SCRIPT) {
-		if (!uwsd_script_connect(cl, digest))
-			return;
+		switch (uwsd_script_connect(cl, digest)) {
+		case UWSD_SCRIPT_TX_ERROR:
+			return client_free(cl, "Error sending connect message to worker: %m");
 
-		uwsd_state_transition(cl, STATE_CONN_WS_IDLE);
+		case UWSD_SCRIPT_TX_PENDING:
+			return uwsd_state_transition(cl, STATE_CONN_WS_UPSTREAM_SEND);
+
+		case UWSD_SCRIPT_TX_DONE:
+			return uwsd_state_transition(cl, STATE_CONN_WS_IDLE);
+		}
 	}
 	else {
 		/* Format handshake reply */
@@ -473,11 +485,28 @@ ws_handle_frame_payload(uwsd_client_context_t *cl)
 	/* for other frames, forward payload upstream */
 	default:
 		if (cl->action->type == UWSD_ACTION_SCRIPT) {
-			if (!uwsd_script_send(cl, cl->tx[0].iov_base, cl->tx[0].iov_len))
-				return false; // XXX: switch to upstream TX mode on partial write
+			uwsd_script_tx_t st = uwsd_script_send(cl, cl->tx[0].iov_base, cl->tx[0].iov_len);
 
+			/* the segment is captured in the worker send buffer either way */
 			cl->tx[0].iov_base += cl->tx[0].iov_len;
 			cl->tx[0].iov_len = 0;
+
+			if (st == UWSD_SCRIPT_TX_ERROR) {
+				client_free(cl, "Error sending data to worker: %m");
+
+				return false;
+			}
+
+			if (st == UWSD_SCRIPT_TX_PENDING) {
+				/* a completed frame is fully captured, so ready the parser for
+				 * the next frame; a partial frame keeps its payload state */
+				if (cl->ws.state == STATE_WS_COMPLETE)
+					ws_state_transition(cl, STATE_WS_HEADER);
+
+				uwsd_state_transition(cl, STATE_CONN_WS_UPSTREAM_SEND);
+
+				return false;
+			}
 
 			return true;
 		}
@@ -514,6 +543,20 @@ ws_handle_frame_completion(uwsd_client_context_t *cl, void *data, size_t len)
 static void
 uwsd_ws_state_upstream_send(uwsd_client_context_t *cl, uwsd_connection_state_t state)
 {
+	/* script workers receive a serialized TLV message; resume flushing it */
+	if (cl->action->type == UWSD_ACTION_SCRIPT) {
+		switch (uwsd_script_flush(cl)) {
+		case UWSD_SCRIPT_TX_PENDING:
+			return;
+
+		case UWSD_SCRIPT_TX_ERROR:
+			return client_free(cl, "Error sending data to worker: %m");
+
+		case UWSD_SCRIPT_TX_DONE:
+			return uwsd_state_transition(cl, STATE_CONN_WS_IDLE);
+		}
+	}
+
 	if (!uwsd_iov_tx(&cl->upstream, STATE_CONN_WS_UPSTREAM_SEND))
 		return; /* partial write, connection closure or error */
 
@@ -540,12 +583,19 @@ uwsd_ws_state_upstream_recv(uwsd_client_context_t *cl, uwsd_connection_state_t s
 		done = ws_downstream_tx_iov(cl);
 	}
 	else {
-		if (!uwsd_io_pending(&cl->upstream))
+		size_t len = uwsd_io_pending(&cl->upstream);
+		void *data;
+
+		if (!len)
 			return uwsd_ws_connection_close(cl, STATUS_GOING_AWAY, "Upstream closed connection");
+
+		data = uwsd_io_getpos(&cl->upstream);
+
+		uwsd_io_consume(&cl->upstream, len);
 
 		done = ws_downstream_tx(cl,
 			cl->action->data.proxy.binary ? OPCODE_BINARY : OPCODE_TEXT,
-			true, uwsd_io_getpos(&cl->upstream), uwsd_io_pending(&cl->upstream));
+			true, data, len);
 	}
 
 	if (!done)
@@ -570,6 +620,13 @@ uwsd_ws_state_downstream_recv(uwsd_client_context_t *cl, uwsd_connection_state_t
 {
 	if (!uwsd_io_readahead(&cl->downstream))
 		return; /* failure */
+
+	/* Peer half-closed the socket: no buffered frame data remains and the fd is
+	 * at EOF. Tear the connection down instead of returning, which would leave
+	 * the level-triggered uloop fd armed and spin the event loop at 100% CPU on
+	 * the persistent EPOLLRDHUP until the idle timeout fires. */
+	if (!uwsd_io_pending(&cl->downstream) && uwsd_io_eof(&cl->downstream))
+		return ws_terminate(cl, STATUS_GOING_AWAY, "Peer closed connection");
 
 	while (uwsd_io_pending(&cl->downstream)) {
 		if (!ws_downstream_rx(cl))

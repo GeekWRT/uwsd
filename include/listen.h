@@ -63,6 +63,7 @@ typedef struct uwsd_action {
 			char *path;
 			char *content_type;
 			char **index_filenames;
+			char **error_filenames;
 			bool directory_listing;
 		} directory;
 		struct {
@@ -116,6 +117,8 @@ typedef struct {
 	char *hostname;
 	uint16_t port;
 	struct uloop_fd ufd;
+	struct uloop_timeout retry;
+	int retry_count;
 	struct list_head matches;
 	struct list_head auth;
 	int request_timeout, transfer_timeout, idle_timeout;

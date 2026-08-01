@@ -120,6 +120,16 @@ http_state_reset(uwsd_client_context_t *cl, uwsd_http_state_t state)
 	cl->http.pipebuf[0] = -1;
 	cl->http.pipebuf[1] = -1;
 
+	/* For file and directory actions upstream.ufd.fd is the served file and
+	 * must be released per request; proxy and script actions keep it as their
+	 * upstream socket and manage it separately. */
+	if (cl->action &&
+	    (cl->action->type == UWSD_ACTION_FILE || cl->action->type == UWSD_ACTION_DIRECTORY) &&
+	    cl->upstream.ufd.fd != -1) {
+		close(cl->upstream.ufd.fd);
+		cl->upstream.ufd.fd = -1;
+	}
+
 	/* Transition to initial HTTP parsing state */
 	http_state_transition(cl, state);
 }
@@ -149,10 +159,13 @@ http_header_parse(uwsd_client_context_t *cl, char *line, size_t len)
 		if (p == name || p == e || *p != ':')
 			return false;
 
-		/* Header name already seen? */
+		/* Header name already seen? Match on the stored name's true length
+		 * first: an embedded NUL in the incoming name would otherwise let
+		 * strncasecmp stop early and the '\0' index below read past the stored
+		 * allocation. */
 		for (i = 0; i < cl->http_num_headers; i++) {
-			if (!strncasecmp(cl->http_headers[i].name, name, p - name) &&
-			    cl->http_headers[i].name[p - name] == '\0') {
+			if (strlen(cl->http_headers[i].name) == (size_t)(p - name) &&
+			    !strncasecmp(cl->http_headers[i].name, name, p - name)) {
 				hdr = &cl->http_headers[i];
 				break;
 			}
@@ -175,8 +188,11 @@ http_header_parse(uwsd_client_context_t *cl, char *line, size_t len)
 		continuation = false;
 	}
 
-	/* Skip leading white space in value */
-	for (; *value == ' ' || *value == '\t'; value++)
+	/* Skip leading white space in value. The bound on 'e' matters: the line is
+	 * not NUL-terminated and shares the reused head accumulator, so an all-white
+	 * space value would otherwise walk past 'e' into stale bytes and make
+	 * (e - value) negative in the copies below. */
+	for (; value < e && (*value == ' ' || *value == '\t'); value++)
 		;
 
 	/* Skip trailing white space in value */
@@ -195,7 +211,7 @@ http_header_parse(uwsd_client_context_t *cl, char *line, size_t len)
 	else {
 		i = strlen(hdr->name);
 		j = strlen(hdr->value);
-		hdr->name = xrealloc(hdr->name, i + 1 + j + 2 + !continuation);
+		hdr->name = xrealloc(hdr->name, i + 1 + j + 2 + !continuation + (e - value));
 		hdr->value = hdr->name + i + 1;
 
 		if (!continuation)
@@ -289,7 +305,13 @@ http_handle_body_data(uwsd_client_context_t *cl, uwsd_connection_t *conn, void *
 			}
 		}
 		else {
-			return uwsd_script_bodydata(cl, data, len);
+			/* the chunk is captured in the worker send buffer either way; the
+			 * caller consumes it and the send loop yields while it drains */
+			if (uwsd_script_bodydata(cl, data, len) == UWSD_SCRIPT_TX_ERROR) {
+				client_free(cl, "Error sending body to worker: %m");
+
+				return false;
+			}
 		}
 	}
 
@@ -333,8 +355,9 @@ http_determine_message_length(uwsd_client_context_t *cl, bool request)
 	else if (cl->http_version <= 0x0100 && cl->request_method == HTTP_POST) {
 		uwsd_http_error_return(cl, 411, "Length Required", "Content-Length required\n");
 	}
-	else if ((!request && http_may_have_body(cl->http_status)) &&
-	         (cl->http_version <= 0x0100 || cl->action->type == UWSD_ACTION_SCRIPT)) {
+	else if (!request && http_may_have_body(cl->http_status)) {
+		/* A response with neither Content-Length nor Transfer-Encoding is
+		 * delimited by connection close (RFC 9112 6.3), so read until EOF. */
 		http_state_transition(cl, STATE_HTTP_BODY_UNTIL_EOF);
 	}
 	else {
@@ -359,6 +382,12 @@ http_chunked_recv(uwsd_client_context_t *cl, uwsd_connection_t *conn)
 		switch (cl->http.state) {
 		case STATE_HTTP_CHUNK_HEADER:
 			if (isxdigit(ch)) {
+				if (cl->request_length > (((size_t)-1) - hex(ch)) / 16) {
+					client_free(cl, "chunk size too large");
+
+					return false;
+				}
+
 				cl->request_length = cl->request_length * 16 + hex(ch);
 			}
 			else if (ch == ';') {
@@ -751,6 +780,12 @@ http_response_recv(uwsd_client_context_t *cl)
 
 		return http_handle_body_data(cl, conn, "", 0);
 
+	case STATE_HTTP_BODY_CLOSE:
+		uwsd_http_debug(cl, "Received %zd bytes after response message",
+			uwsd_io_pending(conn));
+
+		return true;
+
 	default:
 		break;
 	}
@@ -922,7 +957,8 @@ http_tx(uwsd_client_context_t *cl, uwsd_connection_state_t state)
 	if (cl->request_method != HTTP_HEAD) {
 		/* Use sendfile(2) to transfer contents */
 		if (cl->http.response_flags & HTTP_SEND_FILE) {
-			wlen = client_sendfile(conn, file->ufd.fd, NULL, sizeof(conn->buf.data));
+			wlen = client_sendfile(conn, file->ufd.fd, NULL,
+				size_t_min(cl->http.sendfile_len, sizeof(conn->buf.data)));
 
 			if (wlen == -1) {
 				/* The sendfile(2) facility is not implemented or not applicable,
@@ -945,8 +981,10 @@ http_tx(uwsd_client_context_t *cl, uwsd_connection_state_t state)
 				return false; /* failure */
 			}
 
-			/* Remain in send state as long as sendfile(2) transferred data */
-			if (wlen > 0)
+			cl->http.sendfile_len -= wlen;
+
+			/* Remain in send state until the advertised length is transferred */
+			if (wlen > 0 && cl->http.sendfile_len > 0)
 				return false; /* partial send */
 		}
 
@@ -957,9 +995,12 @@ http_tx(uwsd_client_context_t *cl, uwsd_connection_state_t state)
 					return false; /* failure */
 			} while (errno == EINTR);
 
-			/* Remain in send state as long as there is data to transmit */
-			if (uwsd_io_pending(file)) {
-				uwsd_iov_put(cl, uwsd_io_getbuf(file), uwsd_io_pending(file));
+			/* Remain in send state until the advertised length is transferred */
+			size_t avail = size_t_min(uwsd_io_pending(file), cl->http.sendfile_len);
+
+			if (avail > 0) {
+				uwsd_iov_put(cl, uwsd_io_getbuf(file), avail);
+				cl->http.sendfile_len -= avail;
 
 				return false; /* partial send */
 			}
@@ -1061,7 +1102,7 @@ uwsd_http_reply_buffer_varg(char *buf, size_t buflen, double http_version,
 {
 	enum { BARE, LONG, LLONG, DOUBLE, LDBL, INTMAX, SIZET, PTRDIFF } expect;
 	char *pos = buf, *hname, *hvalue;
-	bool has_ctype = false;
+	bool has_ctype = false, has_clen = false;
 	int len, clen;
 	const char *p;
 	va_list ap1;
@@ -1188,6 +1229,7 @@ uwsd_http_reply_buffer_varg(char *buf, size_t buflen, double http_version,
 			pos += len;
 			buflen -= len;
 			has_ctype |= !strcasecmp(hname, "Content-Type");
+			has_clen |= !strcasecmp(hname, "Content-Length");
 		}
 	}
 
@@ -1211,7 +1253,16 @@ uwsd_http_reply_buffer_varg(char *buf, size_t buflen, double http_version,
 		va_end(ap1);
 	}
 	else {
-		len = snprintf(pos, buflen, "\r\n");
+		/* Emit an explicit zero Content-Length so a keep-alive client can
+		 * delimit the empty body, unless the caller already supplied one or the
+		 * status is defined to never carry a body. */
+		bool bodiless = (code >= 100 && code < 200) || code == 204 || code == 304;
+
+		if (has_clen || bodiless)
+			len = snprintf(pos, buflen, "\r\n");
+		else
+			len = snprintf(pos, buflen, "Content-Length: 0\r\n\r\n");
+
 		pos += len;
 		buflen -= len;
 	}
@@ -1308,7 +1359,7 @@ http_proxy_connect(uwsd_client_context_t *cl)
 }
 
 static int
-send_file(uwsd_client_context_t *cl, const char *path, const char *type, struct stat *s)
+send_file(uwsd_client_context_t *cl, uint16_t code, const char *reason, const char *path, const char *type, struct stat *s)
 {
 	char szbuf[sizeof("18446744073709551615")];
 	char *cstype = NULL;
@@ -1322,21 +1373,23 @@ send_file(uwsd_client_context_t *cl, const char *path, const char *type, struct 
 	if (cl->upstream.ufd.fd == -1)
 		return -errno;
 
-	if (uwsd_file_if_range(cl, s) &&
-	    uwsd_file_if_match(cl, s) &&
-	    uwsd_file_if_modified_since(cl, s) &&
+	if (uwsd_file_if_match(cl, s) &&
+	    uwsd_file_if_unmodified_since(cl, s) &&
 	    uwsd_file_if_none_match(cl, s) &&
-	    uwsd_file_if_unmodified_since(cl, s))
+	    uwsd_file_if_modified_since(cl, s) &&
+	    uwsd_file_if_range(cl, s))
 	{
-		snprintf(szbuf, sizeof(szbuf), "%zu", (size_t)s->st_size);
+		snprintf(szbuf, sizeof(szbuf), "%ju", (uintmax_t)s->st_size);
 
 		if (!type || !*type)
 			type = uwsd_file_mime_lookup(path);
 
-		if (config->default_charset && !strncmp(type, "text/", 5) && !strcasestr(type, "charset="))
-			asprintf(&cstype, "%s; charset=%s", type, config->default_charset);
+		if (config->default_charset && !strncmp(type, "text/", 5) && !strcasestr(type, "charset=")) {
+			if (asprintf(&cstype, "%s; charset=%s", type, config->default_charset) == -1)
+				cstype = NULL;
+		}
 
-		uwsd_http_reply(cl, 200, "OK", UWSD_HTTP_REPLY_EMPTY,
+		uwsd_http_reply(cl, code, reason, UWSD_HTTP_REPLY_EMPTY,
 			"Content-Type", cstype ? cstype : type,
 			"Content-Length", szbuf,
 			"ETag", uwsd_file_mktag(s),
@@ -1345,11 +1398,67 @@ send_file(uwsd_client_context_t *cl, const char *path, const char *type, struct 
 			UWSD_HTTP_REPLY_EOH);
 
 		reply_flags |= HTTP_SEND_FILE;
+		cl->http.sendfile_len = s->st_size;
 
 		free(cstype);
 	}
 
 	return uwsd_http_reply_send(cl, reply_flags);
+}
+
+static const char *
+lookup_error_filename(uwsd_action_t *action, int error)
+{
+	char **filenames = action->data.directory.error_filenames;
+	int i;
+
+	if (!filenames)
+		return NULL;
+
+	for (i = 0; filenames[i]; i++) {
+		char *end;
+		int code = strtol(filenames[i], &end, 10);
+
+		if (end == filenames[i])
+			continue;
+
+		while (*end == ' ')
+			end++;
+
+		if (code == error && *end)
+			return end;
+	}
+
+	return NULL;
+}
+
+static bool
+http_error_serve(uwsd_client_context_t *cl, int error, const char *msg, const char *description)
+{
+	const char *filename = lookup_error_filename(cl->action, error);
+	struct stat s;
+
+	if (filename) {
+		char *base = cl->action->data.directory.path;
+		char *path = pathexpand(filename, base);
+
+		if (path && !stat(path, &s) && S_ISREG(s.st_mode)) {
+			int rv = send_file(cl, error, msg, path, cl->action->data.directory.content_type, &s);
+
+			free(path);
+
+			switch (rv) {
+			case 1:       return true;
+			case 0:       return false;
+			default:      break;
+			}
+		}
+		else {
+			free(path);
+		}
+	}
+
+	uwsd_http_error_return(cl, error, msg, description);
 }
 
 static bool
@@ -1377,7 +1486,7 @@ http_file_serve(uwsd_client_context_t *cl)
 		goto error404;
 	}
 
-	rv = send_file(cl, path, cl->action->data.file.content_type, &s);
+	rv = send_file(cl, 200, "OK", path, cl->action->data.file.content_type, &s);
 
 	switch (rv) {
 	case 1:       return true;
@@ -1388,26 +1497,27 @@ http_file_serve(uwsd_client_context_t *cl)
 	}
 
 error403:
-	uwsd_http_error_return(cl, 403, "Permission Denied",
+	return http_error_serve(cl, 403, "Permission Denied",
 		"Access to the requested path is forbidden");
 
 error404:
-	uwsd_http_error_return(cl, 404, "Not Found",
+	return http_error_serve(cl, 404, "Not Found",
 		"The requested path does not exist on this server");
 
 error500:
-	uwsd_http_error_return(cl, 500, "Internal Server Error",
-		"Unable to serve requested path: %s\n", strerror(-rv));
+	return http_error_serve(cl, 500, "Internal Server Error",
+		"Unable to serve requested path");
 }
 
 static char *
 find_index_file(uwsd_client_context_t *cl, const char *path, struct stat *s)
 {
+	char *defaults[] = { "index.html", "index.htm", "default.html", "default.htm", NULL };
 	char **candidates = cl->action->data.directory.index_filenames;
 	char *indexfile = NULL;
 
 	if (!candidates)
-		candidates = (char *[]){ "index.html", "index.htm", "default.html", "default.htm", NULL };
+		candidates = defaults;
 
 	while (*candidates) {
 		indexfile = pathexpand(*candidates, path);
@@ -1467,6 +1577,7 @@ http_directory_serve(uwsd_client_context_t *cl)
 		goto error404;
 
 	url[strcspn(url, "?")] = 0;
+
 	path = pathexpand(url + strspn(url, "/"), base);
 
 	if (!path)
@@ -1498,13 +1609,13 @@ http_directory_serve(uwsd_client_context_t *cl)
 			rv = uwsd_file_directory_list(cl, path, url);
 		}
 		else {
-			rv = send_file(cl, p, type, &s);
+			rv = send_file(cl, 200, "OK", p, type, &s);
 		}
 
 		free(p);
 	}
 	else {
-		rv = send_file(cl, path, NULL, &s);
+		rv = send_file(cl, 200, "OK", path, NULL, &s);
 	}
 
 	switch (rv) {
@@ -1519,22 +1630,22 @@ error403:
 	free(path);
 	free(url);
 
-	uwsd_http_error_return(cl, 403, "Permission Denied",
+	return http_error_serve(cl, 403, "Permission Denied",
 		"Access to the requested path is forbidden");
 
 error404:
 	free(path);
 	free(url);
 
-	uwsd_http_error_return(cl, 404, "Not Found",
+	return http_error_serve(cl, 404, "Not Found",
 		"The requested path does not exist on this server");
 
 error500:
 	free(path);
 	free(url);
 
-	uwsd_http_error_return(cl, 500, "Internal Server Error",
-		"Unable to serve requested path: %s\n", strerror(-rv));
+	return http_error_serve(cl, 500, "Internal Server Error",
+		"Unable to serve requested path");
 
 success:
 	free(path);
@@ -1785,8 +1896,16 @@ uwsd_http_state_upstream_connected(uwsd_client_context_t *cl, uwsd_connection_st
 	size_t i;
 
 	if (cl->action->type == UWSD_ACTION_SCRIPT) {
-		if (!uwsd_script_request(cl))
-			return; /* failure */
+		switch (uwsd_script_request(cl)) {
+		case UWSD_SCRIPT_TX_ERROR:
+			return client_free(cl, "Error sending request to worker: %m");
+
+		case UWSD_SCRIPT_TX_PENDING:
+			return uwsd_state_transition(cl, STATE_CONN_UPSTREAM_SEND);
+
+		case UWSD_SCRIPT_TX_DONE:
+			break;
+		}
 	}
 	else if (cl->action->type == UWSD_ACTION_TCP_PROXY) {
 		uwsd_io_reset(httpbuf);
@@ -1845,10 +1964,27 @@ uwsd_http_state_upstream_connected(uwsd_client_context_t *cl, uwsd_connection_st
 __hidden void
 uwsd_http_state_upstream_send(uwsd_client_context_t *cl, uwsd_connection_state_t state, bool upstream)
 {
+	/* resume a pending worker send before forwarding more request data */
+	if (cl->action->type == UWSD_ACTION_SCRIPT && cl->script_tx.len) {
+		switch (uwsd_script_flush(cl)) {
+		case UWSD_SCRIPT_TX_PENDING:
+			return;
+
+		case UWSD_SCRIPT_TX_ERROR:
+			return client_free(cl, "Error sending request to worker: %m");
+
+		case UWSD_SCRIPT_TX_DONE:
+			break;
+		}
+	}
+
 	while (true) {
 		if (cl->action->type != UWSD_ACTION_SCRIPT &&
 		    !uwsd_iov_tx(&cl->upstream, STATE_CONN_UPSTREAM_SEND))
 			return; /* failure or partial send */
+
+		if (cl->http.state == STATE_HTTP_BODY_CLOSE)
+			break;
 
 		if (!uwsd_io_pending(&cl->downstream) &&
 		    cl->http.state != STATE_HTTP_CHUNK_DONE &&
@@ -1857,6 +1993,10 @@ uwsd_http_state_upstream_send(uwsd_client_context_t *cl, uwsd_connection_state_t
 
 		if (!http_request_recv(cl))
 			return; /* failure */
+
+		/* a body chunk left the worker send buffer full: wait for writability */
+		if (cl->action->type == UWSD_ACTION_SCRIPT && cl->script_tx.len)
+			return;
 	}
 
 	if (cl->http.state == STATE_HTTP_BODY_CLOSE) {
@@ -2116,6 +2256,10 @@ uwsd_http_state_downstream_send(uwsd_client_context_t *cl, uwsd_connection_state
 			cl->http.pipebuf[0], NULL,
 			cl->downstream.ufd.fd, NULL,
 			cl->http.pipebuf_len, SPLICE_F_NONBLOCK);
+
+		/* downstream send buffer full: retry once the socket is writable again */
+		if (wlen < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+			return;
 
 		/* unrecoverable send error */
 		if (wlen < 0)

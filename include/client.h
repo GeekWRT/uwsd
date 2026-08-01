@@ -31,7 +31,7 @@
 
 
 typedef struct {
-	uint8_t data[16384];
+	uint8_t data[65536];  /* 64KB buffer for fragmented sends */
 	uint8_t *pos, *end;
 } uwsd_buffer_t;
 
@@ -75,6 +75,7 @@ typedef struct uwsd_client_context {
 		uint32_t response_flags;
 		int pipebuf[2];
 		size_t pipebuf_len;
+		size_t sendfile_len;
 	} http;
 	struct {
 		uwsd_ws_state_t state;
@@ -92,6 +93,13 @@ typedef struct uwsd_client_context {
 			uint8_t mask[4];
 			char data[125];
 		} buf;
+		struct __attribute__((packed)) {
+			ws_frame_header_t hdr;
+			union {
+				uint16_t len16;
+				uint64_t len64;
+			} ext;
+		} txframe;
 		struct {
 			uint16_t code;
 			char *msg;
@@ -102,6 +110,10 @@ typedef struct uwsd_client_context {
 		uint8_t mask[4];
 	} ws;
 	struct iovec tx[3];
+	struct {
+		uint8_t *buf;
+		size_t len, pos, cap;
+	} script_tx;
 } uwsd_client_context_t;
 
 __hidden void client_create(int, uwsd_listen_t *, struct sockaddr *, size_t);

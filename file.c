@@ -87,12 +87,21 @@ uwsd_file_mktag(struct stat *s)
 __hidden time_t
 uwsd_file_date2unix(const char *date)
 {
+	static const char *formats[] = {
+		"%a, %d %b %Y %H:%M:%S %Z", /* RFC 1123 (IMF-fixdate) */
+		"%A, %d-%b-%y %H:%M:%S %Z", /* RFC 850 */
+		"%a %b %d %H:%M:%S %Y",     /* asctime */
+		NULL
+	};
 	struct tm t;
+	size_t i;
 
-	memset(&t, 0, sizeof(t));
+	for (i = 0; formats[i]; i++) {
+		memset(&t, 0, sizeof(t));
 
-	if (strptime(date, "%a, %d %b %Y %H:%M:%S %Z", &t) != NULL)
-		return timegm(&t);
+		if (strptime(date, formats[i], &t) != NULL)
+			return timegm(&t);
+	}
 
 	return 0;
 }
@@ -129,6 +138,10 @@ uwsd_file_if_modified_since(uwsd_client_context_t *cl, struct stat *s)
 	char *hdr = uwsd_http_header_lookup(cl, "If-Modified-Since");
 
 	if (!hdr)
+		return true;
+
+	/* If-None-Match takes precedence; ignore If-Modified-Since when present. */
+	if (uwsd_http_header_lookup(cl, "If-None-Match"))
 		return true;
 
 	if (uwsd_file_date2unix(hdr) >= s->st_mtime) {
@@ -173,16 +186,8 @@ uwsd_file_if_none_match(uwsd_client_context_t *cl, struct stat *s)
 __hidden bool
 uwsd_file_if_range(uwsd_client_context_t *cl, struct stat *s)
 {
-	char *hdr = uwsd_http_header_lookup(cl, "If-Range");
-
-	if (hdr) {
-		uwsd_http_reply(cl, 412, "Precondition Failed",
-			UWSD_HTTP_REPLY_EMPTY,
-			UWSD_HTTP_REPLY_EOH);
-
-		return false;
-	}
-
+	/* Range requests are not supported, so If-Range carries no meaning and is
+	 * ignored; the full representation is served rather than rejected. */
 	return true;
 }
 
@@ -191,7 +196,11 @@ uwsd_file_if_unmodified_since(uwsd_client_context_t *cl, struct stat *s)
 {
 	char *hdr = uwsd_http_header_lookup(cl, "If-Unmodified-Since");
 
-	if (hdr && uwsd_file_date2unix(hdr) <= s->st_mtime) {
+	/* If-Match takes precedence; ignore If-Unmodified-Since when present. */
+	if (uwsd_http_header_lookup(cl, "If-Match"))
+		return true;
+
+	if (hdr && uwsd_file_date2unix(hdr) < s->st_mtime) {
 		uwsd_http_reply(cl, 412, "Precondition Failed",
 			UWSD_HTTP_REPLY_EMPTY,
 			UWSD_HTTP_REPLY_EOH);
@@ -206,8 +215,8 @@ uwsd_file_if_unmodified_since(uwsd_client_context_t *cl, struct stat *s)
 static int
 dirent_cmp(const struct dirent **a, const struct dirent **b)
 {
-	bool dir_a = !!((*a)->d_type & DT_DIR);
-	bool dir_b = !!((*b)->d_type & DT_DIR);
+	bool dir_a = ((*a)->d_type == DT_DIR);
+	bool dir_b = ((*b)->d_type == DT_DIR);
 
 	/* directories first */
 	if (dir_a != dir_b)
@@ -268,22 +277,28 @@ print_entry(FILE *tmp, struct dirent *e,
 	if ((s.st_mode & mode) != mode)
 		return;
 
-	p = htmlescape(e->d_name);
+	char *disp = htmlescape(e->d_name);
+	char *href = urlencode(e->d_name);
 
-	if (!p)
+	if (!disp || !href) {
+		free(disp);
+		free(href);
+
 		return;
+	}
 
 	fprintf(tmp,
 		"<li><strong><a href='%s/%s%s'>%s</a>%s"
 		"</strong><br /><small>modified: %s"
 		"<br />%s - %.02f kbyte<br />"
 		"<br /></small></li>\n",
-		urlpath, p, (mode & S_IXOTH) ? "/" : "",
-		p, (mode & S_IXOTH) ? "/" : "",
+		urlpath, href, (mode & S_IXOTH) ? "/" : "",
+		disp, (mode & S_IXOTH) ? "/" : "",
 		uwsd_file_unix2date(s.st_mtime),
 		type, s.st_size / 1024.0);
 
-	free(p);
+	free(disp);
+	free(href);
 }
 
 static void
@@ -355,12 +370,16 @@ uwsd_file_directory_list(uwsd_client_context_t *cl, const char *physpath, const 
 		return -err;
 	}
 
-	snprintf(szbuf, sizeof(szbuf), "%lu", ftell(tmp));
+	long len = ftell(tmp);
+
+	snprintf(szbuf, sizeof(szbuf), "%lu", (unsigned long)len);
 
 	fflush(tmp);
 	fclose(tmp);
 
 	lseek(cl->upstream.ufd.fd, 0, SEEK_SET);
+
+	cl->http.sendfile_len = (len > 0) ? (size_t)len : 0;
 
 	uwsd_http_reply(cl, 200, "OK", UWSD_HTTP_REPLY_EMPTY,
 		"Content-Type", type ? type : "text/html; charset=utf-8",

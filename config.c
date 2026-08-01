@@ -266,6 +266,8 @@ static const config_block_t serve_directory_spec = {
 			offsetof(uwsd_action_t, data.directory.content_type), { 0 } },
 		{ "index-filename", LIST,
 			offsetof(uwsd_action_t, data.directory.index_filenames), { 0 } },
+		{ "error-filename", LIST,
+			offsetof(uwsd_action_t, data.directory.error_filenames), { 0 } },
 		{ "directory-listing", BOOLEAN,
 			offsetof(uwsd_action_t, data.directory.directory_listing), { 0 } },
 		{ 0 }
@@ -538,7 +540,7 @@ extract_string(const char **input, const char *separator)
 	}
 	else {
 		for (output = buf; !strchr(separator, **input); (*input)++) {
-			if (output - buf == sizeof(buf)) {
+			if (output - buf == sizeof(buf) - 1) {
 				uwsd_log_err(NULL, "String value too long");
 
 				return NULL;
@@ -608,6 +610,12 @@ config_free_object(const config_block_t *spec, void *base)
 
 			break;
 
+		case LIST:
+			free(charptr_ptr(prop, base));
+			charptr_ptr(prop, base) = NULL;
+
+			break;
+
 		default:
 			break;
 		}
@@ -670,7 +678,7 @@ config_parse_value(const char **input, const config_prop_t *prop, void *base)
 		p = extract_string(input, ";");
 		n = p ? strtol(p, &e, 0) : 0;
 
-		if (!p || e == buf || *e)
+		if (!p || e == p || *e)
 			return parse_error("Expecting number");
 
 		int_ptr(prop, base) = n;
@@ -681,7 +689,7 @@ config_parse_value(const char **input, const config_prop_t *prop, void *base)
 		e = extract_string(input, ";");
 
 		for (n = 0, p = prop->data.values[0]; p; p = prop->data.values[++n]) {
-			if (e && *e && !strncmp(e, p, strlen(e))) {
+			if (e && *e && !strcmp(e, p)) {
 				int_ptr(prop, base) = n;
 				break;
 			}
@@ -711,8 +719,11 @@ config_parse_value(const char **input, const config_prop_t *prop, void *base)
 		while (true) {
 			e = extract_string(input, ",;");
 
-			if (!e)
+			if (!e) {
+				free(l);
+
 				return false;
+			}
 
 			if (*e) {
 				l = xrealloc(l, sizeof(char *) * (n + 2));
@@ -1318,19 +1329,20 @@ parse_file(int dir, const char *file, struct stat *st)
 
 	input = xalloc(st->st_size + 1);
 
-	read(fd, input, st->st_size);
+	(void)read(fd, input, st->st_size);
 	close(fd);
 
 	off = (const char *)input;
+	skipws(&off);
 
-	do {
+	while (*off != '\0') {
 		if (!config_parse_property(&off, &toplevel_spec, config)) {
 			print_error_pos(file, input, off);
 			free(input);
 
 			return false;
 		}
-	} while (*off != '\0');
+	}
 
 	free(input);
 
@@ -1340,7 +1352,7 @@ parse_file(int dir, const char *file, struct stat *st)
 static int
 filter_file(const struct dirent *e)
 {
-	char *s = strchr(e->d_name, '.');
+	char *s = strrchr(e->d_name, '.');
 
 	return (strcmp(e->d_name, ".") && strcmp(e->d_name, "..") && s && !strcmp(s, ".conf"));
 }
@@ -1361,6 +1373,9 @@ uwsd_config_parse(const char *path)
 	config = config_alloc_object(&toplevel_spec, NULL);
 
 	if (S_ISDIR(st.st_mode)) {
+		bool ok = true;
+		int i;
+
 		fd = open(path, O_RDONLY);
 
 		if (fd == -1) {
@@ -1378,18 +1393,21 @@ uwsd_config_parse(const char *path)
 			return false;
 		}
 
-		for (; nfiles; files++, nfiles--) {
-			if (fstatat(fd, files[0]->d_name, &st, 0) == -1) {
-				sys_perror("Unable to stat() '%s'", files[0]->d_name);
-
-				continue;
-			}
-
-			if (!parse_file(fd, files[0]->d_name, &st))
-				goto error;
+		for (i = 0; ok && i < nfiles; i++) {
+			if (fstatat(fd, files[i]->d_name, &st, 0) == -1)
+				sys_perror("Unable to stat() '%s'", files[i]->d_name);
+			else if (!parse_file(fd, files[i]->d_name, &st))
+				ok = false;
 		}
 
+		for (i = 0; i < nfiles; i++)
+			free(files[i]);
+
+		free(files);
 		close(fd);
+
+		if (!ok)
+			goto error;
 	}
 	else {
 		if (!parse_file(AT_FDCWD, path, &st))
